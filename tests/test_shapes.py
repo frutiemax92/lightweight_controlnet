@@ -53,10 +53,16 @@ class DummyModel(torch.nn.Module):
         super().__init__()
         self.blocks = torch.nn.ModuleList([DummyBlock(width) for _ in range(depth)])
         self.proj_out = torch.nn.Linear(width, width)
+        # checkpointed one block at a time, the way diffusers checkpoints a unet or a transformer
+        self.gradient_checkpointing = False
 
     def forward(self, hidden_states):
         for block in self.blocks:
-            hidden_states = block(hidden_states)
+            if self.gradient_checkpointing and torch.is_grad_enabled():
+                hidden_states = torch.utils.checkpoint.checkpoint(block, hidden_states,
+                                                                  use_reentrant=False)
+            else:
+                hidden_states = block(hidden_states)
         return self.proj_out(hidden_states)
 
 
@@ -168,6 +174,57 @@ def test_shapes_and_identity():
     print('test_shapes_and_identity ok')
 
 
+def test_strength():
+    model, control, _ = build_patched_model()
+    simulate_trained_lora(model)
+    hidden_states = torch.randn(BATCH, SEQUENCE, WIDTH)
+    features = build_reference_features()
+
+    with torch.no_grad():
+        for modulator in control.modulators.values():
+            torch.nn.init.normal_(modulator.out_proj.weight, std=0.1)
+            torch.nn.init.normal_(modulator.film.weight, std=0.1)
+        baseline = model(hidden_states)
+        with control.reference(features):
+            full = model(hidden_states)
+            control.strength = 0.0
+            off = model(hidden_states)
+            control.strength = 0.5
+            half = model(hidden_states)
+            control.strength = 1.0
+            back = model(hidden_states)
+
+    assert control.strength == 1.0
+    assert torch.allclose(off, baseline, atol=1e-6), 'strength 0 is not the unconditioned output'
+    assert torch.allclose(back, full, atol=1e-6), 'strength did not restore'
+    assert not torch.allclose(half, full, atol=1e-5), 'strength 0.5 changed nothing'
+    delta_half = (half - baseline).abs().max()
+    delta_full = (full - baseline).abs().max()
+    assert delta_half < delta_full, (delta_half, delta_full)
+    print(f'  strength 0 is the plain lora output, 0.5 moves it by {delta_half:.4f}, '
+          f'1.0 by {delta_full:.4f}')
+
+    # the scope restores whatever was set before, exception or not
+    control.strength = 0.25
+    with control.strength_scope(2.0):
+        assert control.strength == 2.0
+    assert control.strength == 0.25
+    try:
+        with control.strength_scope(2.0):
+            raise RuntimeError
+    except RuntimeError:
+        pass
+    assert control.strength == 0.25
+    control.strength = 1.0
+
+    # nothing about the dial reaches a checkpoint
+    control.strength = 0.3
+    assert not any('strength' in key for key in control.control_state_dict())
+    control.strength = 1.0
+    print('  strength stays out of the state dict and strength_scope restores')
+    print('test_strength ok')
+
+
 def test_variable_reference_shapes():
     model, control, _ = build_patched_model()
     hidden_states = torch.randn(BATCH, SEQUENCE, WIDTH)
@@ -225,6 +282,77 @@ def test_gradients():
     print(f'  {len(with_gradient)}/{len(trainable)} reference tensors got a gradient '
           f'(the zero projections keep the rest at zero on the first step)')
     print('test_gradients ok')
+
+
+def _gradients_of(model, control, hidden_states, features, checkpointing, backward_inside_scope):
+    """The reference path gradients of one step, run with or without gradient checkpointing."""
+    base_model = model.base_model.model
+    base_model.gradient_checkpointing = checkpointing
+    for parameter in control.trainable_parameters():
+        parameter.grad = None
+
+    if backward_inside_scope:
+        with control.reference(features):
+            model(hidden_states).square().mean().backward()
+    else:
+        # what a training loop does: the block sets the conditioning up, and the backward pass
+        # happens after it closed, which is when the checkpointed blocks replay their forward
+        with control.reference(features):
+            loss = model(hidden_states).square().mean()
+        loss.backward()
+
+    base_model.gradient_checkpointing = False
+    # a pass that ran as a plain lora never reaches the modulators, so its gradient stays None
+    return {name: (None if modulator.out_proj.weight.grad is None
+                   else modulator.out_proj.weight.grad.clone())
+            for name, modulator in control.modulators.items()}
+
+
+def test_gradient_checkpointing():
+    model, control, _ = build_patched_model()
+    simulate_trained_lora(model)
+    with torch.no_grad():
+        for modulator in control.modulators.values():
+            torch.nn.init.normal_(modulator.out_proj.weight, std=0.1)
+            torch.nn.init.normal_(modulator.film.weight, std=0.1)
+
+    torch.manual_seed(1)
+    hidden_states = torch.randn(BATCH, SEQUENCE, WIDTH)
+    features = build_reference_features()
+
+    plain = _gradients_of(model, control, hidden_states, features, False, False)
+    for backward_inside_scope in [True, False]:
+        # the checkpointed run has to replay the modulated forward, not the plain lora one, whether
+        # or not the reference block is still open when backward runs
+        checkpointed = _gradients_of(model, control, hidden_states, features, True,
+                                     backward_inside_scope)
+        for name, gradient in plain.items():
+            assert torch.allclose(gradient, checkpointed[name], atol=1e-5), \
+                f'{name} differs with checkpointing, backward inside the scope: {backward_inside_scope}'
+        where = 'inside' if backward_inside_scope else 'outside'
+        print(f'  backward {where} the reference block: gradients match the uncheckpointed run '
+              f'(max delta {max((plain[name] - checkpointed[name]).abs().max() for name in plain):.2e})')
+
+    # the reference dropout of a training step must replay as a plain lora, not resurrect the
+    # conditioning of the step before it
+    dropped = _gradients_of(model, control, hidden_states, None, True, False)
+    assert all(gradient is None or gradient.abs().sum() == 0 for gradient in dropped.values()), \
+        'a dropped out step got a gradient through the reference path'
+    print('  a step whose reference was dropped replays as a plain lora')
+
+    # so must a forward that never opened a block at all, after one that did
+    base_model = model.base_model.model
+    for parameter in control.trainable_parameters():
+        parameter.grad = None
+    base_model.gradient_checkpointing = True
+    model(hidden_states).square().mean().backward()
+    base_model.gradient_checkpointing = False
+    assert all(modulator.out_proj.weight.grad is None
+               or modulator.out_proj.weight.grad.abs().sum() == 0
+               for modulator in control.modulators.values()), \
+        'an unreferenced forward pass picked up a stale conditioning'
+    print('  an unreferenced forward pass after a referenced one stays a plain lora')
+    print('test_gradient_checkpointing ok')
 
 
 def test_conv_lora():
@@ -300,8 +428,10 @@ if __name__ == '__main__':
     for test in [test_resolve_grid,
                  test_preprocess_aspect_ratio,
                  test_shapes_and_identity,
+                 test_strength,
                  test_variable_reference_shapes,
                  test_gradients,
+                 test_gradient_checkpointing,
                  test_conv_lora,
                  test_save_load_and_removal,
                  test_real_dinov2]:

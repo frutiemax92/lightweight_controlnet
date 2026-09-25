@@ -55,6 +55,43 @@ class ReferenceControl(torch.nn.Module):
         return self._modulators
 
     @property
+    def strength(self) -> float:
+        """How far the reference is allowed to move the rank tensor, 1.0 being the value the model
+        was trained at. It is an inference dial: nothing about it is saved, loaded or learned, so
+        leaving it alone keeps a training run exactly as it was.
+
+        0.0 bypasses the modulators entirely, which gives the plain LoRA output `reference(None)`
+        gives; between 0 and 1 the reference is blended in; above 1 it is over driven, and far
+        above it the model leaves the distribution it was trained on.
+        """
+        strengths = {modulator.strength for modulator in self._modulators.values()}
+        if len(strengths) > 1:
+            raise ValueError(f'the modulators hold different strengths ({sorted(strengths)}), '
+                             'read them from control.modulators instead')
+        return strengths.pop() if strengths else 1.0
+
+    @strength.setter
+    def strength(self, value: float):
+        value = float(value)
+        for modulator in self._modulators.values():
+            modulator.strength = value
+
+    @contextmanager
+    def strength_scope(self, value: float):
+        """Run a block at a given strength and restore whatever was set before:
+
+            with control.strength_scope(0.5), control.reference(images):
+                image = pipeline(prompt).images[0]
+        """
+        previous = {name: modulator.strength for name, modulator in self._modulators.items()}
+        self.strength = value
+        try:
+            yield value
+        finally:
+            for name, modulator in self._modulators.items():
+                modulator.strength = previous[name]
+
+    @property
     def encoder(self) -> Optional[ReferenceEncoder]:
         return self._encoder
 
@@ -85,9 +122,21 @@ class ReferenceControl(torch.nn.Module):
             raise ValueError('no reference encoder was attached, pass precomputed ReferenceFeatures instead')
         return self._encoder(images)
 
-    def prepare(self, reference: Union[Sequence[torch.Tensor], ReferenceFeatures]) -> ReferenceConditioning:
+    def conditioning_for(self,
+                         reference: Union[Sequence[torch.Tensor], ReferenceFeatures, None],
+                         ) -> Optional[ReferenceConditioning]:
+        """Run the shared conditioner over a reference, without installing the result anywhere."""
+        if reference is None:
+            return None
         features = reference if isinstance(reference, ReferenceFeatures) else self.encode(reference)
-        conditioning = self.conditioner(features)
+        return self.conditioner(features)
+
+    def prepare(self, reference: Union[Sequence[torch.Tensor], ReferenceFeatures]) -> ReferenceConditioning:
+        """Install a conditioning that stays in place until it is replaced or cleared.
+
+        `reference()` is the form to prefer, since it cannot be left behind on the way out.
+        """
+        conditioning = self.conditioning_for(reference)
         self.context.set(conditioning)
         return conditioning
 
@@ -96,16 +145,19 @@ class ReferenceControl(torch.nn.Module):
         """
         with control.reference(images):
             noise_prediction = transformer(latents, timesteps, encoder_hidden_states)
+            loss.backward()
 
         Passing None runs the model as a plain LoRA, which is what the reference dropout of
         classifier free guidance training needs.
+
+        Keep the backward pass inside the block when the model is gradient checkpointed. The
+        checkpointed blocks replay their forward from inside backward and the modulators read the
+        conditioning as they go, so the scope has to still be open - or, failing that, be the last
+        one this context closed, which is what makes the usual forward, backward, next step order
+        work either way.
         """
-        previous = self.context.current
-        self.context.set(None if reference is None else self.prepare(reference))
-        try:
-            yield self.context.current
-        finally:
-            self.context.set(previous)
+        with self.context.scope(self.conditioning_for(reference)) as conditioning:
+            yield conditioning
 
     def control_state_dict(self) -> dict[str, torch.Tensor]:
         state = {f'conditioner.{key}': value for key, value in self.conditioner.state_dict().items()}

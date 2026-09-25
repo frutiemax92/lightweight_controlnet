@@ -80,11 +80,13 @@ def main():
         # reference dropout, so the model also learns the unconditional path for guidance
         reference = None if random.random() < REFERENCE_DROPOUT else features
 
+        # backward inside the block: a gradient checkpointed model replays the forward of its
+        # blocks from inside backward, and the modulators read the conditioning as they go
         with control.reference(reference):
             prediction = transformer(latents)
-        loss = torch.nn.functional.mse_loss(prediction, target)
+            loss = torch.nn.functional.mse_loss(prediction, target)
+            loss.backward()
 
-        loss.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         print(f'step {step}: loss {loss.item():.4f}, reference '

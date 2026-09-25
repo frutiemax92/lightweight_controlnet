@@ -110,10 +110,36 @@ optimizer = torch.optim.AdamW([
 
 with control.reference(reference_images):          # or precomputed ReferenceFeatures
     noise_prediction = transformer(latents, timestep, encoder_hidden_states).sample
+    loss = loss_fn(noise_prediction, target)
+    loss.backward()
 ```
 
 `control.reference(None)` runs the model as a plain LoRA, which is what reference dropout for
-classifier free guidance needs. `remove_reference_control(model, config)` puts the original
+classifier free guidance needs.
+
+## Control strength
+
+`control.strength` dials how far the reference is allowed to move the output at inference time:
+
+```python
+control.strength = 0.5                  # half the trained influence
+with control.reference(reference_images):
+    image = pipeline(prompt).images[0]
+
+with control.strength_scope(1.4):       # or scoped, restored on the way out
+    ...
+```
+
+1.0 is the value training runs at and the default, 0.0 bypasses the modulators entirely and gives
+the same output as `reference(None)`, and above 1.0 over drives the reference. It is a plain float
+on each modulator, so it is never saved, loaded or learned - training is unaffected as long as it
+is left alone. `infer_krea2_controlnet.py --control_strength` exposes it on the command line.
+
+The backward pass is inside the block on purpose. Gradient checkpointing replays the forward of
+every checkpointed block from inside backward, and the modulators read the conditioning as they
+go, so it has to still be there. Calling backward after the block has closed works too - the
+context serves the replay whatever the last forward pass ran with - but keeping it inside is what
+stays correct when several references are in flight at once. `remove_reference_control(model, config)` puts the original
 `lora_A` modules back. `control.save_pretrained(...)` writes the conditioner and the modulators
 next to the peft adapter, which stays a normal peft checkpoint.
 
