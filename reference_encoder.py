@@ -5,7 +5,7 @@ from typing import Optional, Sequence
 import torch
 import torch.nn.functional as F
 
-from lightweight_controlnet.config import ReferenceControlConfig
+from lightweight_controlnet.config import FourierControlConfig
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -59,7 +59,7 @@ def resolve_grid(height: int,
 
 
 def preprocess_reference(images: Sequence[torch.Tensor],
-                         config: ReferenceControlConfig,
+                         config: FourierControlConfig,
                          device=None,
                          dtype=torch.float32):
     """
@@ -119,7 +119,7 @@ class ReferenceEncoder(torch.nn.Module):
     base model, and it can be dropped entirely at training time by feeding ReferenceFeatures that
     were precomputed offline.
     """
-    def __init__(self, config: ReferenceControlConfig, model=None):
+    def __init__(self, config: FourierControlConfig, model=None):
         super().__init__()
         self.config = config
         if model is None:

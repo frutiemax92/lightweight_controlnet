@@ -1,10 +1,15 @@
-from lightweight_controlnet.config import ReferenceControlConfig
-from lightweight_controlnet.conditioner import ReferenceConditioner, ReferenceConditioning
-from lightweight_controlnet.modulator import ConditioningContext, ModulatedLoraA, RankModulator
+from lightweight_controlnet.conditioner import (
+    FieldNorm,
+    ReferenceConditioner,
+    ReferenceConditioning,
+)
+from lightweight_controlnet.config import FourierControlConfig
+from lightweight_controlnet.context import ConditioningContext, in_backward
 from lightweight_controlnet.patch import (
-    ReferenceControl,
-    apply_reference_control,
-    remove_reference_control,
+    FourierControl,
+    apply_fourier_control,
+    controllable_modules,
+    remove_fourier_control,
 )
 from lightweight_controlnet.reference_encoder import (
     ReferenceEncoder,
@@ -12,19 +17,32 @@ from lightweight_controlnet.reference_encoder import (
     preprocess_reference,
     resolve_grid,
 )
+from lightweight_controlnet.spectrum import (
+    FourierSpectrum,
+    add_delta,
+    broadcast_delta,
+    choose_slots,
+    output_dim_of,
+)
 
 __all__ = [
-    'ReferenceControlConfig',
+    'FourierControlConfig',
+    'FourierControl',
+    'FourierSpectrum',
     'ReferenceConditioner',
     'ReferenceConditioning',
-    'ConditioningContext',
-    'ModulatedLoraA',
-    'RankModulator',
-    'ReferenceControl',
-    'apply_reference_control',
-    'remove_reference_control',
     'ReferenceEncoder',
     'ReferenceFeatures',
+    'ConditioningContext',
+    'FieldNorm',
+    'apply_fourier_control',
+    'remove_fourier_control',
+    'controllable_modules',
     'preprocess_reference',
     'resolve_grid',
+    'output_dim_of',
+    'choose_slots',
+    'broadcast_delta',
+    'add_delta',
+    'in_backward',
 ]
